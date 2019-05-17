@@ -22,14 +22,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/log"
-	ch "github.com/ethereum/go-ethereum/swarm/chunk"
+	"github.com/ethereum/go-ethereum/swarm/chunk"
 	"github.com/mattn/go-colorable"
 )
 
@@ -59,31 +57,7 @@ func brokenLimitReader(data io.Reader, size int, errAt int) *brokenLimitedReader
 	}
 }
 
-func newLDBStore(t *testing.T) (*LDBStore, func()) {
-	dir, err := ioutil.TempDir("", "bzz-storage-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	log.Trace("memstore.tempdir", "dir", dir)
-
-	ldbparams := NewLDBStoreParams(NewDefaultStoreParams(), dir)
-	db, err := NewLDBStore(ldbparams)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cleanup := func() {
-		db.Close()
-		err := os.RemoveAll(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	return db, cleanup
-}
-
-func mputRandomChunks(store ChunkStore, n int, chunksize int64) ([]Chunk, error) {
+func mputRandomChunks(store ChunkStore, n int) ([]Chunk, error) {
 	return mput(store, n, GenerateRandomChunk)
 }
 
@@ -91,17 +65,18 @@ func mput(store ChunkStore, n int, f func(i int64) Chunk) (hs []Chunk, err error
 	// put to localstore and wait for stored channel
 	// does not check delivery error state
 	errc := make(chan error)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 	defer cancel()
 	for i := int64(0); i < int64(n); i++ {
-		chunk := f(ch.DefaultSize)
+		ch := f(chunk.DefaultSize)
 		go func() {
+			_, err := store.Put(ctx, chunk.ModePutUpload, ch)
 			select {
-			case errc <- store.Put(ctx, chunk):
+			case errc <- err:
 			case <-ctx.Done():
 			}
 		}()
-		hs = append(hs, chunk)
+		hs = append(hs, ch)
 	}
 
 	// wait for all chunks to be stored
@@ -123,13 +98,13 @@ func mget(store ChunkStore, hs []Address, f func(h Address, chunk Chunk) error) 
 		go func(h Address) {
 			defer wg.Done()
 			// TODO: write timeout with context
-			chunk, err := store.Get(context.TODO(), h)
+			ch, err := store.Get(context.TODO(), chunk.ModeGetRequest, h)
 			if err != nil {
 				errc <- err
 				return
 			}
 			if f != nil {
-				err = f(h, chunk)
+				err = f(h, ch)
 				if err != nil {
 					errc <- err
 					return
@@ -142,10 +117,11 @@ func mget(store ChunkStore, hs []Address, f func(h Address, chunk Chunk) error) 
 		close(errc)
 	}()
 	var err error
+	timeout := 20 * time.Second
 	select {
 	case err = <-errc:
-	case <-time.NewTimer(5 * time.Second).C:
-		err = fmt.Errorf("timed out after 5 seconds")
+	case <-time.NewTimer(timeout).C:
+		err = fmt.Errorf("timed out after %v", timeout)
 	}
 	return err
 }
@@ -158,8 +134,8 @@ func (r *brokenLimitedReader) Read(buf []byte) (int, error) {
 	return r.lr.Read(buf)
 }
 
-func testStoreRandom(m ChunkStore, n int, chunksize int64, t *testing.T) {
-	chunks, err := mputRandomChunks(m, n, chunksize)
+func testStoreRandom(m ChunkStore, n int, t *testing.T) {
+	chunks, err := mputRandomChunks(m, n)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -169,8 +145,8 @@ func testStoreRandom(m ChunkStore, n int, chunksize int64, t *testing.T) {
 	}
 }
 
-func testStoreCorrect(m ChunkStore, n int, chunksize int64, t *testing.T) {
-	chunks, err := mputRandomChunks(m, n, chunksize)
+func testStoreCorrect(m ChunkStore, n int, t *testing.T) {
+	chunks, err := mputRandomChunks(m, n)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -179,8 +155,9 @@ func testStoreCorrect(m ChunkStore, n int, chunksize int64, t *testing.T) {
 			return fmt.Errorf("key does not match retrieved chunk Address")
 		}
 		hasher := MakeHashFunc(DefaultHash)()
-		hasher.ResetWithLength(chunk.SpanBytes())
-		hasher.Write(chunk.Payload())
+		data := chunk.Data()
+		hasher.ResetWithLength(data[:8])
+		hasher.Write(data[8:])
 		exp := hasher.Sum(nil)
 		if !bytes.Equal(h, exp) {
 			return fmt.Errorf("key is not hash of chunk data")
@@ -193,7 +170,7 @@ func testStoreCorrect(m ChunkStore, n int, chunksize int64, t *testing.T) {
 	}
 }
 
-func benchmarkStorePut(store ChunkStore, n int, chunksize int64, b *testing.B) {
+func benchmarkStorePut(store ChunkStore, n int, b *testing.B) {
 	chunks := make([]Chunk, n)
 	i := 0
 	f := func(dataSize int64) Chunk {
@@ -220,8 +197,8 @@ func benchmarkStorePut(store ChunkStore, n int, chunksize int64, b *testing.B) {
 	}
 }
 
-func benchmarkStoreGet(store ChunkStore, n int, chunksize int64, b *testing.B) {
-	chunks, err := mputRandomChunks(store, n, chunksize)
+func benchmarkStoreGet(store ChunkStore, n int, b *testing.B) {
+	chunks, err := mputRandomChunks(store, n)
 	if err != nil {
 		b.Fatalf("expected no error, got %v", err)
 	}
@@ -248,14 +225,15 @@ func NewMapChunkStore() *MapChunkStore {
 	}
 }
 
-func (m *MapChunkStore) Put(_ context.Context, ch Chunk) error {
+func (m *MapChunkStore) Put(_ context.Context, _ chunk.ModePut, ch Chunk) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	_, exists := m.chunks[ch.Address().Hex()]
 	m.chunks[ch.Address().Hex()] = ch
-	return nil
+	return exists, nil
 }
 
-func (m *MapChunkStore) Get(_ context.Context, ref Address) (Chunk, error) {
+func (m *MapChunkStore) Get(_ context.Context, _ chunk.ModeGet, ref Address) (Chunk, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	chunk := m.chunks[ref.Hex()]
@@ -265,7 +243,29 @@ func (m *MapChunkStore) Get(_ context.Context, ref Address) (Chunk, error) {
 	return chunk, nil
 }
 
-func (m *MapChunkStore) Close() {
+// Need to implement Has from SyncChunkStore
+func (m *MapChunkStore) Has(ctx context.Context, ref Address) (has bool, err error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	_, has = m.chunks[ref.Hex()]
+	return has, nil
+}
+
+func (m *MapChunkStore) Set(ctx context.Context, mode chunk.ModeSet, addr chunk.Address) (err error) {
+	return nil
+}
+
+func (m *MapChunkStore) LastPullSubscriptionBinID(bin uint8) (id uint64, err error) {
+	return 0, nil
+}
+
+func (m *MapChunkStore) SubscribePull(ctx context.Context, bin uint8, since, until uint64) (c <-chan chunk.Descriptor, stop func()) {
+	return nil, nil
+}
+
+func (m *MapChunkStore) Close() error {
+	return nil
 }
 
 func chunkAddresses(chunks []Chunk) []Address {

@@ -25,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	ch "github.com/ethereum/go-ethereum/swarm/chunk"
+	"github.com/ethereum/go-ethereum/swarm/chunk"
 	"github.com/ethereum/go-ethereum/swarm/log"
 )
 
@@ -71,11 +71,6 @@ const (
 	splitTimeout    = time.Minute * 5
 )
 
-const (
-	DataChunk = 0
-	TreeChunk = 1
-)
-
 type PyramidSplitterParams struct {
 	SplitterParams
 	getter Getter
@@ -101,12 +96,12 @@ func NewPyramidSplitterParams(addr Address, reader io.Reader, putter Putter, get
 	When splitting, data is given as a SectionReader, and the key is a hashSize long byte slice (Address), the root hash of the entire content will fill this once processing finishes.
 	New chunks to store are store using the putter which the caller provides.
 */
-func PyramidSplit(ctx context.Context, reader io.Reader, putter Putter, getter Getter) (Address, func(context.Context) error, error) {
-	return NewPyramidSplitter(NewPyramidSplitterParams(nil, reader, putter, getter, ch.DefaultSize)).Split(ctx)
+func PyramidSplit(ctx context.Context, reader io.Reader, putter Putter, getter Getter, tag *chunk.Tag) (Address, func(context.Context) error, error) {
+	return NewPyramidSplitter(NewPyramidSplitterParams(nil, reader, putter, getter, chunk.DefaultSize), tag).Split(ctx)
 }
 
-func PyramidAppend(ctx context.Context, addr Address, reader io.Reader, putter Putter, getter Getter) (Address, func(context.Context) error, error) {
-	return NewPyramidSplitter(NewPyramidSplitterParams(addr, reader, putter, getter, ch.DefaultSize)).Append(ctx)
+func PyramidAppend(ctx context.Context, addr Address, reader io.Reader, putter Putter, getter Getter, tag *chunk.Tag) (Address, func(context.Context) error, error) {
+	return NewPyramidSplitter(NewPyramidSplitterParams(addr, reader, putter, getter, chunk.DefaultSize), tag).Append(ctx)
 }
 
 // Entry to create a tree node
@@ -147,6 +142,7 @@ type PyramidChunker struct {
 	putter      Putter
 	getter      Getter
 	key         Address
+	tag         *chunk.Tag
 	workerCount int64
 	workerLock  sync.RWMutex
 	jobC        chan *chunkJob
@@ -157,7 +153,7 @@ type PyramidChunker struct {
 	chunkLevel  [][]*TreeEntry
 }
 
-func NewPyramidSplitter(params *PyramidSplitterParams) (pc *PyramidChunker) {
+func NewPyramidSplitter(params *PyramidSplitterParams, tag *chunk.Tag) (pc *PyramidChunker) {
 	pc = &PyramidChunker{}
 	pc.reader = params.reader
 	pc.hashSize = params.hashSize
@@ -166,6 +162,7 @@ func NewPyramidSplitter(params *PyramidSplitterParams) (pc *PyramidChunker) {
 	pc.putter = params.putter
 	pc.getter = params.getter
 	pc.key = params.addr
+	pc.tag = tag
 	pc.workerCount = 0
 	pc.jobC = make(chan *chunkJob, 2*ChunkProcessors)
 	pc.wg = &sync.WaitGroup{}
@@ -206,8 +203,6 @@ func (pc *PyramidChunker) decrementWorkerCount() {
 }
 
 func (pc *PyramidChunker) Split(ctx context.Context) (k Address, wait func(context.Context) error, err error) {
-	log.Debug("pyramid.chunker: Split()")
-
 	pc.wg.Add(1)
 	pc.prepareChunks(ctx, false)
 
@@ -240,7 +235,6 @@ func (pc *PyramidChunker) Split(ctx context.Context) (k Address, wait func(conte
 }
 
 func (pc *PyramidChunker) Append(ctx context.Context) (k Address, wait func(context.Context) error, err error) {
-	log.Debug("pyramid.chunker: Append()")
 	// Load the right most unfinished tree chunks in every level
 	pc.loadTree(ctx)
 
@@ -281,6 +275,7 @@ func (pc *PyramidChunker) processor(ctx context.Context, id int64) {
 				return
 			}
 			pc.processChunk(ctx, id, job)
+			pc.tag.Inc(chunk.StateSplit)
 		case <-pc.quitC:
 			return
 		}
@@ -288,8 +283,6 @@ func (pc *PyramidChunker) processor(ctx context.Context, id int64) {
 }
 
 func (pc *PyramidChunker) processChunk(ctx context.Context, id int64, job *chunkJob) {
-	log.Debug("pyramid.chunker: processChunk()", "id", id)
-
 	ref, err := pc.putter.Put(ctx, job.chunk)
 	if err != nil {
 		select {
@@ -306,7 +299,6 @@ func (pc *PyramidChunker) processChunk(ctx context.Context, id int64, job *chunk
 }
 
 func (pc *PyramidChunker) loadTree(ctx context.Context) error {
-	log.Debug("pyramid.chunker: loadTree()")
 	// Get the root chunk to get the total size
 	chunkData, err := pc.getter.Get(ctx, Reference(pc.key))
 	if err != nil {
@@ -391,7 +383,6 @@ func (pc *PyramidChunker) loadTree(ctx context.Context) error {
 }
 
 func (pc *PyramidChunker) prepareChunks(ctx context.Context, isAppend bool) {
-	log.Debug("pyramid.chunker: prepareChunks", "isAppend", isAppend)
 	defer pc.wg.Done()
 
 	chunkWG := &sync.WaitGroup{}

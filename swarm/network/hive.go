@@ -114,9 +114,9 @@ func (h *Hive) Stop() error {
 		}
 	}
 	log.Info(fmt.Sprintf("%08x hive stopped, dropping peers", h.BaseAddr()[:4]))
-	h.EachConn(nil, 255, func(p *Peer, _ int, _ bool) bool {
+	h.EachConn(nil, 255, func(p *Peer, _ int) bool {
 		log.Info(fmt.Sprintf("%08x dropping peer %08x", h.BaseAddr()[:4], p.Address()[:4]))
-		p.Drop(nil)
+		p.Drop()
 		return true
 	})
 
@@ -165,8 +165,8 @@ func (h *Hive) Run(p *BzzPeer) error {
 			// otherwise just send depth to new peer
 			dp.NotifyDepth(depth)
 		}
+		NotifyPeer(p.BzzAddr, h.Kademlia)
 	}
-	NotifyPeer(p.BzzAddr, h.Kademlia)
 	defer h.Off(dp)
 	return dp.Run(dp.HandleMsg)
 }
@@ -192,9 +192,7 @@ func (h *Hive) NodeInfo() interface{} {
 // PeerInfo function is used by the p2p.server RPC interface to display
 // protocol specific information any connected peer referred to by their NodeID
 func (h *Hive) PeerInfo(id enode.ID) interface{} {
-	h.lock.Lock()
-	p := h.peers[id]
-	h.lock.Unlock()
+	p := h.Peer(id)
 
 	if p == nil {
 		return nil
@@ -207,6 +205,15 @@ func (h *Hive) PeerInfo(id enode.ID) interface{} {
 		OAddr: addr.OAddr,
 		UAddr: addr.UAddr,
 	}
+}
+
+// Peer returns a bzz peer from the Hive. If there is no peer
+// with the provided enode id, a nil value is returned.
+func (h *Hive) Peer(id enode.ID) *BzzPeer {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+
+	return h.peers[id]
 }
 
 // loadPeers, savePeer implement persistence callback/
@@ -228,7 +235,7 @@ func (h *Hive) loadPeers() error {
 // savePeers, savePeer implement persistence callback/
 func (h *Hive) savePeers() error {
 	var peers []*BzzAddr
-	h.Kademlia.EachAddr(nil, 256, func(pa *BzzAddr, i int, _ bool) bool {
+	h.Kademlia.EachAddr(nil, 256, func(pa *BzzAddr, i int) bool {
 		if pa == nil {
 			log.Warn(fmt.Sprintf("empty addr: %v", i))
 			return true

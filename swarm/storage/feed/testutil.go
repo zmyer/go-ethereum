@@ -18,12 +18,13 @@ package feed
 
 import (
 	"context"
-	"fmt"
 	"path/filepath"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/swarm/chunk"
 	"github.com/ethereum/go-ethereum/swarm/storage"
+	"github.com/ethereum/go-ethereum/swarm/storage/localstore"
 )
 
 const (
@@ -40,9 +41,9 @@ func (t *TestHandler) Close() {
 
 type mockNetFetcher struct{}
 
-func (m *mockNetFetcher) Request(ctx context.Context, hopCount uint8) {
+func (m *mockNetFetcher) Request(hopCount uint8) {
 }
-func (m *mockNetFetcher) Offer(ctx context.Context, source *enode.ID) {
+func (m *mockNetFetcher) Offer(source *enode.ID) {
 }
 
 func newFakeNetFetcher(context.Context, storage.Address, *sync.Map) storage.NetFetcher {
@@ -53,14 +54,14 @@ func newFakeNetFetcher(context.Context, storage.Address, *sync.Map) storage.NetF
 func NewTestHandler(datadir string, params *HandlerParams) (*TestHandler, error) {
 	path := filepath.Join(datadir, testDbDirName)
 	fh := NewHandler(params)
-	localstoreparams := storage.NewDefaultLocalStoreParams()
-	localstoreparams.Init(path)
-	localStore, err := storage.NewLocalStore(localstoreparams, nil)
+
+	db, err := localstore.New(filepath.Join(path, "chunks"), make([]byte, 32), nil)
 	if err != nil {
-		return nil, fmt.Errorf("localstore create fail, path %s: %v", path, err)
+		return nil, err
 	}
-	localStore.Validators = append(localStore.Validators, storage.NewContentAddressValidator(storage.MakeHashFunc(feedsHashAlgorithm)))
-	localStore.Validators = append(localStore.Validators, fh)
+
+	localStore := chunk.NewValidatorStore(db, storage.NewContentAddressValidator(storage.MakeHashFunc(feedsHashAlgorithm)), fh)
+
 	netStore, err := storage.NewNetStore(localStore, nil)
 	if err != nil {
 		return nil, err

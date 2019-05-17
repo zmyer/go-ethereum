@@ -243,7 +243,7 @@ func (p *Peer) Run(handler func(ctx context.Context, msg interface{}) error) err
 // Drop disconnects a peer.
 // TODO: may need to implement protocol drop only? don't want to kick off the peer
 // if they are useful for other protocols
-func (p *Peer) Drop(err error) {
+func (p *Peer) Drop() {
 	p.Disconnect(p2p.DiscSubprotocolError)
 }
 
@@ -254,6 +254,7 @@ func (p *Peer) Drop(err error) {
 func (p *Peer) Send(ctx context.Context, msg interface{}) error {
 	defer metrics.GetOrRegisterResettingTimer("peer.send_t", nil).UpdateSince(time.Now())
 	metrics.GetOrRegisterCounter("peer.send", nil).Inc(1)
+	metrics.GetOrRegisterCounter(fmt.Sprintf("peer.send.%T", msg), nil).Inc(1)
 
 	var b bytes.Buffer
 	if tracing.Enabled {
@@ -291,7 +292,7 @@ func (p *Peer) Send(ctx context.Context, msg interface{}) error {
 	if p.spec.Hook != nil {
 		err := p.spec.Hook.Send(p, wmsg.Size, msg)
 		if err != nil {
-			p.Drop(err)
+			p.Drop()
 			return err
 		}
 	}
@@ -386,10 +387,12 @@ func (p *Peer) handleIncoming(handle func(ctx context.Context, msg interface{}) 
 // * the dialing peer needs to send the handshake first and then waits for remote
 // * the listening peer waits for the remote handshake and then sends it
 // returns the remote handshake and an error
-func (p *Peer) Handshake(ctx context.Context, hs interface{}, verify func(interface{}) error) (rhs interface{}, err error) {
+func (p *Peer) Handshake(ctx context.Context, hs interface{}, verify func(interface{}) error) (interface{}, error) {
 	if _, ok := p.spec.GetCode(hs); !ok {
 		return nil, errorf(ErrHandshake, "unknown handshake message type: %T", hs)
 	}
+
+	var rhs interface{}
 	errc := make(chan error, 2)
 	handle := func(ctx context.Context, msg interface{}) error {
 		rhs = msg
@@ -412,6 +415,7 @@ func (p *Peer) Handshake(ctx context.Context, hs interface{}, verify func(interf
 	}()
 
 	for i := 0; i < 2; i++ {
+		var err error
 		select {
 		case err = <-errc:
 		case <-ctx.Done():
@@ -422,4 +426,18 @@ func (p *Peer) Handshake(ctx context.Context, hs interface{}, verify func(interf
 		}
 	}
 	return rhs, nil
+}
+
+// HasCap returns true if Peer has a capability
+// with provided name.
+func (p *Peer) HasCap(capName string) (yes bool) {
+	if p == nil || p.Peer == nil {
+		return false
+	}
+	for _, c := range p.Caps() {
+		if c.Name == capName {
+			return true
+		}
+	}
+	return false
 }

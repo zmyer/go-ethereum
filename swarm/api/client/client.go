@@ -19,6 +19,7 @@ package client
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"io/ioutil"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptrace"
 	"net/textproto"
 	"net/url"
 	"os"
@@ -33,14 +35,15 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/swarm/api"
+	swarmhttp "github.com/ethereum/go-ethereum/swarm/api/http"
+	"github.com/ethereum/go-ethereum/swarm/spancontext"
 	"github.com/ethereum/go-ethereum/swarm/storage/feed"
-)
-
-var (
-	DefaultGateway = "http://localhost:8500"
-	DefaultClient  = NewClient(DefaultGateway)
+	"github.com/pborman/uuid"
 )
 
 var (
@@ -73,6 +76,8 @@ func (c *Client) UploadRaw(r io.Reader, size int64, toEncrypt bool) (string, err
 		return "", err
 	}
 	req.ContentLength = size
+	req.Header.Set(swarmhttp.SwarmTagHeaderName, fmt.Sprintf("raw_upload_%d", time.Now().Unix()))
+
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
@@ -109,6 +114,7 @@ func (c *Client) DownloadRaw(hash string) (io.ReadCloser, bool, error) {
 type File struct {
 	io.ReadCloser
 	api.ManifestEntry
+	Tag string
 }
 
 // Open opens a local file which can then be passed to client.Upload to upload
@@ -137,6 +143,7 @@ func Open(path string) (*File, error) {
 			Size:        stat.Size(),
 			ModTime:     stat.ModTime(),
 		},
+		Tag: filepath.Base(path),
 	}, nil
 }
 
@@ -420,6 +427,7 @@ func (c *Client) List(hash, prefix, credentials string) (*api.ManifestList, erro
 // Uploader uploads files to swarm using a provided UploadFn
 type Uploader interface {
 	Upload(UploadFn) error
+	Tag() string
 }
 
 type UploaderFunc func(UploadFn) error
@@ -428,10 +436,21 @@ func (u UploaderFunc) Upload(upload UploadFn) error {
 	return u(upload)
 }
 
+func (u UploaderFunc) Tag() string {
+	return fmt.Sprintf("multipart_upload_%d", time.Now().Unix())
+}
+
+// DirectoryUploader implements Uploader
+var _ Uploader = &DirectoryUploader{}
+
 // DirectoryUploader uploads all files in a directory, optionally uploading
 // a file to the default path
 type DirectoryUploader struct {
 	Dir string
+}
+
+func (d *DirectoryUploader) Tag() string {
+	return filepath.Base(d.Dir)
 }
 
 // Upload performs the upload of the directory and default path
@@ -456,9 +475,15 @@ func (d *DirectoryUploader) Upload(upload UploadFn) error {
 	})
 }
 
+var _ Uploader = &FileUploader{}
+
 // FileUploader uploads a single file
 type FileUploader struct {
 	File *File
+}
+
+func (f *FileUploader) Tag() string {
+	return f.File.Tag
 }
 
 // Upload performs the upload of the file
@@ -474,6 +499,11 @@ type UploadFn func(file *File) error
 // TarUpload uses the given Uploader to upload files to swarm as a tar stream,
 // returning the resulting manifest hash
 func (c *Client) TarUpload(hash string, uploader Uploader, defaultPath string, toEncrypt bool) (string, error) {
+	ctx, sp := spancontext.StartSpan(context.Background(), "api.client.tarupload")
+	defer sp.Finish()
+
+	var tn time.Time
+
 	reqR, reqW := io.Pipe()
 	defer reqR.Close()
 	addr := hash
@@ -489,12 +519,26 @@ func (c *Client) TarUpload(hash string, uploader Uploader, defaultPath string, t
 	if err != nil {
 		return "", err
 	}
+
+	trace := GetClientTrace("swarm api client - upload tar", "api.client.uploadtar", uuid.New()[:8], &tn)
+
+	req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
+	transport := http.DefaultTransport
+
 	req.Header.Set("Content-Type", "application/x-tar")
 	if defaultPath != "" {
 		q := req.URL.Query()
 		q.Set("defaultpath", defaultPath)
 		req.URL.RawQuery = q.Encode()
 	}
+
+	tag := uploader.Tag()
+	if tag == "" {
+		tag = "unnamed_tag_" + fmt.Sprintf("%d", time.Now().Unix())
+	}
+	log.Trace("setting upload tag", "tag", tag)
+
+	req.Header.Set(swarmhttp.SwarmTagHeaderName, tag)
 
 	// use 'Expect: 100-continue' so we don't send the request body if
 	// the server refuses the request
@@ -529,8 +573,8 @@ func (c *Client) TarUpload(hash string, uploader Uploader, defaultPath string, t
 		}
 		reqW.CloseWithError(err)
 	}()
-
-	res, err := http.DefaultClient.Do(req)
+	tn = time.Now()
+	res, err := transport.RoundTrip(req)
 	if err != nil {
 		return "", err
 	}
@@ -561,6 +605,7 @@ func (c *Client) MultipartUpload(hash string, uploader Uploader) (string, error)
 
 	mw := multipart.NewWriter(reqW)
 	req.Header.Set("Content-Type", fmt.Sprintf("multipart/form-data; boundary=%q", mw.Boundary()))
+	req.Header.Set(swarmhttp.SwarmTagHeaderName, fmt.Sprintf("multipart_upload_%d", time.Now().Unix()))
 
 	// define an UploadFn which adds files to the multipart form
 	uploadFn := func(file *File) error {
@@ -727,4 +772,58 @@ func (c *Client) GetFeedRequest(query *feed.Query, manifestAddressOrDomain strin
 		return nil, err
 	}
 	return &metadata, nil
+}
+
+func GetClientTrace(traceMsg, metricPrefix, ruid string, tn *time.Time) *httptrace.ClientTrace {
+	trace := &httptrace.ClientTrace{
+		GetConn: func(_ string) {
+			log.Trace(traceMsg+" - http get", "event", "GetConn", "ruid", ruid)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".getconn", nil).Update(time.Since(*tn))
+		},
+		GotConn: func(_ httptrace.GotConnInfo) {
+			log.Trace(traceMsg+" - http get", "event", "GotConn", "ruid", ruid)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".gotconn", nil).Update(time.Since(*tn))
+		},
+		PutIdleConn: func(err error) {
+			log.Trace(traceMsg+" - http get", "event", "PutIdleConn", "ruid", ruid, "err", err)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".putidle", nil).Update(time.Since(*tn))
+		},
+		GotFirstResponseByte: func() {
+			log.Trace(traceMsg+" - http get", "event", "GotFirstResponseByte", "ruid", ruid)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".firstbyte", nil).Update(time.Since(*tn))
+		},
+		Got100Continue: func() {
+			log.Trace(traceMsg, "event", "Got100Continue", "ruid", ruid)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".got100continue", nil).Update(time.Since(*tn))
+		},
+		DNSStart: func(_ httptrace.DNSStartInfo) {
+			log.Trace(traceMsg, "event", "DNSStart", "ruid", ruid)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".dnsstart", nil).Update(time.Since(*tn))
+		},
+		DNSDone: func(_ httptrace.DNSDoneInfo) {
+			log.Trace(traceMsg, "event", "DNSDone", "ruid", ruid)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".dnsdone", nil).Update(time.Since(*tn))
+		},
+		ConnectStart: func(network, addr string) {
+			log.Trace(traceMsg, "event", "ConnectStart", "ruid", ruid, "network", network, "addr", addr)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".connectstart", nil).Update(time.Since(*tn))
+		},
+		ConnectDone: func(network, addr string, err error) {
+			log.Trace(traceMsg, "event", "ConnectDone", "ruid", ruid, "network", network, "addr", addr, "err", err)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".connectdone", nil).Update(time.Since(*tn))
+		},
+		WroteHeaders: func() {
+			log.Trace(traceMsg, "event", "WroteHeaders(request)", "ruid", ruid)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".wroteheaders", nil).Update(time.Since(*tn))
+		},
+		Wait100Continue: func() {
+			log.Trace(traceMsg, "event", "Wait100Continue", "ruid", ruid)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".wait100continue", nil).Update(time.Since(*tn))
+		},
+		WroteRequest: func(_ httptrace.WroteRequestInfo) {
+			log.Trace(traceMsg, "event", "WroteRequest", "ruid", ruid)
+			metrics.GetOrRegisterResettingTimer(metricPrefix+".wroterequest", nil).Update(time.Since(*tn))
+		},
+	}
+	return trace
 }

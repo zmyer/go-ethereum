@@ -18,188 +18,359 @@ package main
 
 import (
 	"bytes"
-	"crypto/md5"
-	crand "crypto/rand"
-	"crypto/tls"
-	"errors"
+	"context"
+	"encoding/hex"
 	"fmt"
-	"io"
 	"io/ioutil"
-	"net/http"
+	"math/rand"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/pborman/uuid"
+	"github.com/ethereum/go-ethereum/metrics"
+	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/ethereum/go-ethereum/swarm/chunk"
+	"github.com/ethereum/go-ethereum/swarm/storage"
+	"github.com/ethereum/go-ethereum/swarm/testutil"
 
 	cli "gopkg.in/urfave/cli.v1"
 )
 
-func generateEndpoints(scheme string, cluster string, app string, from int, to int) {
-	if cluster == "prod" {
-		for port := from; port <= to; port++ {
-			endpoints = append(endpoints, fmt.Sprintf("%s://%v.swarm-gateways.net", scheme, port))
-		}
-	} else {
-		for port := from; port <= to; port++ {
-			endpoints = append(endpoints, fmt.Sprintf("%s://%s-%v-%s.stg.swarm-gateways.net", scheme, app, port, cluster))
-		}
+func uploadAndSyncCmd(ctx *cli.Context) error {
+	// use input seed if it has been set
+	if inputSeed != 0 {
+		seed = inputSeed
 	}
 
-	if includeLocalhost {
-		endpoints = append(endpoints, "http://localhost:8500")
+	randomBytes := testutil.RandomBytes(seed, filesize*1000)
+
+	errc := make(chan error)
+
+	go func() {
+		errc <- uploadAndSync(ctx, randomBytes)
+	}()
+
+	var err error
+	select {
+	case err = <-errc:
+		if err != nil {
+			metrics.GetOrRegisterCounter(fmt.Sprintf("%s.fail", commandName), nil).Inc(1)
+		}
+	case <-time.After(time.Duration(timeout) * time.Second):
+		metrics.GetOrRegisterCounter(fmt.Sprintf("%s.timeout", commandName), nil).Inc(1)
+
+		err = fmt.Errorf("timeout after %v sec", timeout)
 	}
+
+	// trigger debug functionality on randomBytes
+	e := trackChunks(randomBytes[:], true)
+	if e != nil {
+		log.Error(e.Error())
+	}
+
+	return err
 }
 
-func cliUploadAndSync(c *cli.Context) error {
-	log.PrintOrigins(true)
-	log.Root().SetHandler(log.LvlFilterHandler(log.Lvl(verbosity), log.StreamHandler(os.Stdout, log.TerminalFormat(true))))
-
-	defer func(now time.Time) { log.Info("total time", "time", time.Since(now), "kb", filesize) }(time.Now())
-
-	generateEndpoints(scheme, cluster, appName, from, to)
-
-	log.Info("uploading to " + endpoints[0] + " and syncing")
-
-	f, cleanup := generateRandomFile(filesize * 1000)
-	defer cleanup()
-
-	hash, err := upload(f, endpoints[0])
+func trackChunks(testData []byte, submitMetrics bool) error {
+	addrs, err := getAllRefs(testData)
 	if err != nil {
-		log.Error(err.Error())
 		return err
 	}
 
-	fhash, err := digest(f)
-	if err != nil {
-		log.Error(err.Error())
-		return err
+	for i, ref := range addrs {
+		log.Debug(fmt.Sprintf("ref %d", i), "ref", ref)
 	}
 
-	log.Info("uploaded successfully", "hash", hash, "digest", fmt.Sprintf("%x", fhash))
+	var globalYes, globalNo int
+	var globalMu sync.Mutex
+	var hasErr bool
 
-	time.Sleep(3 * time.Second)
+	var wg sync.WaitGroup
+	wg.Add(len(hosts))
 
-	wg := sync.WaitGroup{}
-	for _, endpoint := range endpoints {
-		ruid := uuid.New()[:8]
-		wg.Add(1)
-		go func(endpoint string, ruid string) {
-			for {
-				err := fetch(hash, endpoint, fhash, ruid)
-				if err != nil {
-					continue
-				}
+	var mu sync.Mutex                    // mutex protecting the allHostsChunks and bzzAddrs maps
+	allHostChunks := map[string]string{} // host->bitvector of presence for chunks
+	bzzAddrs := map[string]string{}      // host->bzzAddr
 
-				wg.Done()
+	for _, host := range hosts {
+		host := host
+		go func() {
+			defer wg.Done()
+			httpHost := fmt.Sprintf("ws://%s:%d", host, 8546)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			rpcClient, err := rpc.DialContext(ctx, httpHost)
+			if rpcClient != nil {
+				defer rpcClient.Close()
+			}
+			if err != nil {
+				log.Error("error dialing host", "err", err, "host", httpHost)
+				hasErr = true
 				return
 			}
-		}(endpoint, ruid)
+
+			hostChunks, err := getChunksBitVectorFromHost(rpcClient, addrs)
+			if err != nil {
+				log.Error("error getting chunks bit vector from host", "err", err, "host", httpHost)
+				hasErr = true
+				return
+			}
+
+			bzzAddr, err := getBzzAddrFromHost(rpcClient)
+			if err != nil {
+				log.Error("error getting bzz addrs from host", "err", err, "host", httpHost)
+				hasErr = true
+				return
+			}
+
+			mu.Lock()
+			allHostChunks[host] = hostChunks
+			bzzAddrs[host] = bzzAddr
+			mu.Unlock()
+
+			yes, no := 0, 0
+			for _, val := range hostChunks {
+				if val == '1' {
+					yes++
+				} else {
+					no++
+				}
+			}
+
+			if no == 0 {
+				log.Info("host reported to have all chunks", "host", host)
+			}
+
+			log.Debug("chunks", "chunks", hostChunks, "yes", yes, "no", no, "host", host)
+
+			if submitMetrics {
+				globalMu.Lock()
+				globalYes += yes
+				globalNo += no
+				globalMu.Unlock()
+			}
+		}()
 	}
+
 	wg.Wait()
-	log.Info("all endpoints synced random file successfully")
+
+	checkChunksVsMostProxHosts(addrs, allHostChunks, bzzAddrs)
+
+	if !hasErr && submitMetrics {
+		// remove the chunks stored on the uploader node
+		globalYes -= len(addrs)
+
+		metrics.GetOrRegisterCounter("deployment.chunks.yes", nil).Inc(int64(globalYes))
+		metrics.GetOrRegisterCounter("deployment.chunks.no", nil).Inc(int64(globalNo))
+		metrics.GetOrRegisterCounter("deployment.chunks.refs", nil).Inc(int64(len(addrs)))
+	}
 
 	return nil
 }
 
-// fetch is getting the requested `hash` from the `endpoint` and compares it with the `original` file
-func fetch(hash string, endpoint string, original []byte, ruid string) error {
-	log.Trace("sleeping", "ruid", ruid)
-	time.Sleep(3 * time.Second)
+// getChunksBitVectorFromHost returns a bit vector of presence for a given slice of chunks from a given host
+func getChunksBitVectorFromHost(client *rpc.Client, addrs []storage.Address) (string, error) {
+	var hostChunks string
 
-	log.Trace("http get request", "ruid", ruid, "api", endpoint, "hash", hash)
-	client := &http.Client{Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}}
-	res, err := client.Get(endpoint + "/bzz:/" + hash + "/")
-	if err != nil {
-		log.Warn(err.Error(), "ruid", ruid)
-		return err
-	}
-	log.Trace("http get response", "ruid", ruid, "api", endpoint, "hash", hash, "code", res.StatusCode, "len", res.ContentLength)
-
-	if res.StatusCode != 200 {
-		err := fmt.Errorf("expected status code %d, got %v", 200, res.StatusCode)
-		log.Warn(err.Error(), "ruid", ruid)
-		return err
-	}
-
-	defer res.Body.Close()
-
-	rdigest, err := digest(res.Body)
-	if err != nil {
-		log.Warn(err.Error(), "ruid", ruid)
-		return err
-	}
-
-	if !bytes.Equal(rdigest, original) {
-		err := fmt.Errorf("downloaded imported file md5=%x is not the same as the generated one=%x", rdigest, original)
-		log.Warn(err.Error(), "ruid", ruid)
-		return err
-	}
-
-	log.Trace("downloaded file matches random file", "ruid", ruid, "len", res.ContentLength)
-
-	return nil
-}
-
-// upload is uploading a file `f` to `endpoint` via the `swarm up` cmd
-func upload(f *os.File, endpoint string) (string, error) {
-	var out bytes.Buffer
-	cmd := exec.Command("swarm", "--bzzapi", endpoint, "up", f.Name())
-	cmd.Stdout = &out
-	err := cmd.Run()
+	err := client.Call(&hostChunks, "bzz_has", addrs)
 	if err != nil {
 		return "", err
 	}
-	hash := strings.TrimRight(out.String(), "\r\n")
-	return hash, nil
+
+	return hostChunks, nil
 }
 
-func digest(r io.Reader) ([]byte, error) {
-	h := md5.New()
-	_, err := io.Copy(h, r)
+// getBzzAddrFromHost returns the bzzAddr for a given host
+func getBzzAddrFromHost(client *rpc.Client) (string, error) {
+	var hive string
+
+	err := client.Call(&hive, "bzz_hive")
+	if err != nil {
+		return "", err
+	}
+
+	// we make an ugly assumption about the output format of the hive.String() method
+	// ideally we should replace this with an API call that returns the bzz addr for a given host,
+	// but this also works for now (provided we don't change the hive.String() method, which we haven't in some time
+	ss := strings.Split(strings.Split(hive, "\n")[3], " ")
+	return ss[len(ss)-1], nil
+}
+
+// checkChunksVsMostProxHosts is checking:
+// 1. whether a chunk has been found at less than 2 hosts. Considering our NN size, this should not happen.
+// 2. if a chunk is not found at its closest node. This should also not happen.
+// Together with the --only-upload flag, we could run this smoke test and make sure that our syncing
+// functionality is correct (without even trying to retrieve the content).
+//
+// addrs - a slice with all uploaded chunk refs
+// allHostChunks - host->bit vector, showing what chunks are present on what hosts
+// bzzAddrs - host->bzz address, used when determining the most proximate host for a given chunk
+func checkChunksVsMostProxHosts(addrs []storage.Address, allHostChunks map[string]string, bzzAddrs map[string]string) {
+	for k, v := range bzzAddrs {
+		log.Trace("bzzAddr", "bzz", v, "host", k)
+	}
+
+	for i := range addrs {
+		var foundAt int
+		maxProx := -1
+		var maxProxHost string
+		for host := range allHostChunks {
+			if allHostChunks[host][i] == '1' {
+				foundAt++
+			}
+
+			ba, err := hex.DecodeString(bzzAddrs[host])
+			if err != nil {
+				panic(err)
+			}
+
+			// calculate the host closest to any chunk
+			prox := chunk.Proximity(addrs[i], ba)
+			if prox > maxProx {
+				maxProx = prox
+				maxProxHost = host
+			}
+		}
+
+		if allHostChunks[maxProxHost][i] == '0' {
+			log.Error("chunk not found at max prox host", "ref", addrs[i], "host", maxProxHost, "bzzAddr", bzzAddrs[maxProxHost])
+		} else {
+			log.Trace("chunk present at max prox host", "ref", addrs[i], "host", maxProxHost, "bzzAddr", bzzAddrs[maxProxHost])
+		}
+
+		// if chunk found at less than 2 hosts
+		if foundAt < 2 {
+			log.Error("chunk found at less than two hosts", "foundAt", foundAt, "ref", addrs[i])
+		}
+	}
+}
+
+func getAllRefs(testData []byte) (storage.AddressCollection, error) {
+	datadir, err := ioutil.TempDir("", "chunk-debug")
+	if err != nil {
+		return nil, fmt.Errorf("unable to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(datadir)
+	fileStore, err := storage.NewLocalFileStore(datadir, make([]byte, 32), chunk.NewTags())
 	if err != nil {
 		return nil, err
 	}
-	return h.Sum(nil), nil
+
+	reader := bytes.NewReader(testData)
+	return fileStore.GetAllReferences(context.Background(), reader, false)
 }
 
-// generates random data in heap buffer
-func generateRandomData(datasize int) ([]byte, error) {
-	b := make([]byte, datasize)
-	c, err := crand.Read(b)
+func uploadAndSync(c *cli.Context, randomBytes []byte) error {
+	log.Info("uploading to "+httpEndpoint(hosts[0])+" and syncing", "seed", seed)
+
+	t1 := time.Now()
+	hash, err := upload(randomBytes, httpEndpoint(hosts[0]))
 	if err != nil {
-		return nil, err
-	} else if c != datasize {
-		return nil, errors.New("short read")
+		log.Error(err.Error())
+		return err
 	}
-	return b, nil
+	t2 := time.Since(t1)
+	metrics.GetOrRegisterResettingTimer("upload-and-sync.upload-time", nil).Update(t2)
+
+	fhash, err := digest(bytes.NewReader(randomBytes))
+	if err != nil {
+		log.Error(err.Error())
+		return err
+	}
+
+	log.Info("uploaded successfully", "hash", hash, "took", t2, "digest", fmt.Sprintf("%x", fhash))
+
+	// wait to sync and log chunks before fetch attempt, only if syncDelay is set to true
+	if syncDelay {
+		waitToSync()
+
+		log.Debug("chunks before fetch attempt", "hash", hash)
+
+		err = trackChunks(randomBytes, false)
+		if err != nil {
+			log.Error(err.Error())
+		}
+	}
+
+	if onlyUpload {
+		log.Debug("only-upload is true, stoppping test", "hash", hash)
+		return nil
+	}
+
+	randIndex := 1 + rand.Intn(len(hosts)-1)
+
+	for {
+		start := time.Now()
+		err := fetch(hash, httpEndpoint(hosts[randIndex]), fhash, "")
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		ended := time.Since(start)
+
+		metrics.GetOrRegisterResettingTimer("upload-and-sync.single.fetch-time", nil).Update(ended)
+		log.Info("fetch successful", "took", ended, "endpoint", httpEndpoint(hosts[randIndex]))
+		break
+	}
+
+	return nil
 }
 
-// generateRandomFile is creating a temporary file with the requested byte size
-func generateRandomFile(size int) (f *os.File, teardown func()) {
-	// create a tmp file
-	tmp, err := ioutil.TempFile("", "swarm-test")
+func isSyncing(wsHost string) (bool, error) {
+	rpcClient, err := rpc.Dial(wsHost)
+	if rpcClient != nil {
+		defer rpcClient.Close()
+	}
+
 	if err != nil {
-		panic(err)
+		log.Error("error dialing host", "err", err)
+		return false, err
 	}
 
-	// callback for tmp file cleanup
-	teardown = func() {
-		tmp.Close()
-		os.Remove(tmp.Name())
-	}
-
-	buf := make([]byte, size)
-	_, err = crand.Read(buf)
+	var isSyncing bool
+	err = rpcClient.Call(&isSyncing, "bzz_isSyncing")
 	if err != nil {
-		panic(err)
+		log.Error("error calling host for isSyncing", "err", err)
+		return false, err
 	}
-	ioutil.WriteFile(tmp.Name(), buf, 0755)
 
-	return tmp, teardown
+	log.Debug("isSyncing result", "host", wsHost, "isSyncing", isSyncing)
+
+	return isSyncing, nil
+}
+
+func waitToSync() {
+	t1 := time.Now()
+
+	ns := uint64(1)
+
+	for ns > 0 {
+		time.Sleep(3 * time.Second)
+
+		notSynced := uint64(0)
+		var wg sync.WaitGroup
+		wg.Add(len(hosts))
+		for i := 0; i < len(hosts); i++ {
+			i := i
+			go func(idx int) {
+				stillSyncing, err := isSyncing(wsEndpoint(hosts[idx]))
+
+				if stillSyncing || err != nil {
+					atomic.AddUint64(&notSynced, 1)
+				}
+				wg.Done()
+			}(i)
+		}
+		wg.Wait()
+
+		ns = atomic.LoadUint64(&notSynced)
+	}
+
+	t2 := time.Since(t1)
+	metrics.GetOrRegisterResettingTimer("upload-and-sync.single.wait-for-sync.deployment", nil).Update(t2)
 }

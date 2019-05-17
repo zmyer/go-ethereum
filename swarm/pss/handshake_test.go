@@ -14,8 +14,6 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-// +build foo
-
 package pss
 
 import (
@@ -30,6 +28,7 @@ import (
 // asymmetrical key exchange between two directly connected peers
 // full address, partial address (8 bytes) and empty address
 func TestHandshake(t *testing.T) {
+	t.Skip("Handshakes have not been maintained for a longer period, and have started to fail. They should be reviewed and possible removed.")
 	t.Run("32", testHandshake)
 	t.Run("8", testHandshake)
 	t.Run("0", testHandshake)
@@ -46,7 +45,7 @@ func testHandshake(t *testing.T) {
 
 	// set up two nodes directly connected
 	// (we are not testing pss routing here)
-	clients, err := setupNetwork(2)
+	clients, err := setupNetwork(2, true)
 	if err != nil {
 		t.Fatal(err)
 	}

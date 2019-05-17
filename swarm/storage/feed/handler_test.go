@@ -31,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/swarm/chunk"
 	"github.com/ethereum/go-ethereum/swarm/storage"
 	"github.com/ethereum/go-ethereum/swarm/storage/feed/lookup"
+	"github.com/ethereum/go-ethereum/swarm/storage/localstore"
 )
 
 var (
@@ -40,7 +41,6 @@ var (
 	}
 	cleanF       func()
 	subtopicName = "føø.bar"
-	hashfunc     = storage.MakeHashFunc(storage.DefaultHash)
 )
 
 func init() {
@@ -177,8 +177,8 @@ func TestFeedsHandler(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if request.Epoch.Base() != 0 || request.Epoch.Level != 22 {
-		t.Fatalf("Expected epoch base time to be %d, got %d. Expected epoch level to be %d, got %d", 0, request.Epoch.Base(), 22, request.Epoch.Level)
+	if request.Epoch.Base() != 0 || request.Epoch.Level != 28 {
+		t.Fatalf("Expected epoch base time to be %d, got %d. Expected epoch level to be %d, got %d", 0, request.Epoch.Base(), 28, request.Epoch.Level)
 	}
 	data = []byte(updates[3])
 	request.SetData(data)
@@ -213,8 +213,8 @@ func TestFeedsHandler(t *testing.T) {
 	if !bytes.Equal(update2.data, []byte(updates[len(updates)-1])) {
 		t.Fatalf("feed update data was %v, expected %v", string(update2.data), updates[len(updates)-1])
 	}
-	if update2.Level != 22 {
-		t.Fatalf("feed update epoch level was %d, expected 22", update2.Level)
+	if update2.Level != 28 {
+		t.Fatalf("feed update epoch level was %d, expected 28", update2.Level)
 	}
 	if update2.Base() != 0 {
 		t.Fatalf("feed update epoch base time was %d, expected 0", update2.Base())
@@ -366,7 +366,7 @@ func TestValidator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rh.Validate(chunk.Address(), chunk.Data()) {
+	if !rh.Validate(chunk) {
 		t.Fatal("Chunk validator fail on update chunk")
 	}
 
@@ -375,7 +375,7 @@ func TestValidator(t *testing.T) {
 	address[0] = 11
 	address[15] = 99
 
-	if rh.Validate(address, chunk.Data()) {
+	if rh.Validate(storage.NewChunk(address, chunk.Data())) {
 		t.Fatal("Expected Validate to fail with false chunk address")
 	}
 }
@@ -401,9 +401,7 @@ func TestValidatorInStore(t *testing.T) {
 	}
 	defer os.RemoveAll(datadir)
 
-	handlerParams := storage.NewDefaultLocalStoreParams()
-	handlerParams.Init(datadir)
-	store, err := storage.NewLocalStore(handlerParams, nil)
+	localstore, err := localstore.New(datadir, make([]byte, 32), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +409,7 @@ func TestValidatorInStore(t *testing.T) {
 	// set up Swarm feeds handler and add is as a validator to the localstore
 	fhParams := &HandlerParams{}
 	fh := NewHandler(fhParams)
-	store.Validators = append(store.Validators, fh)
+	store := chunk.NewValidatorStore(localstore, fh)
 
 	// create content addressed chunks, one good, one faulty
 	chunks := storage.GenerateRandomChunks(chunk.DefaultSize, 2)
@@ -448,15 +446,15 @@ func TestValidatorInStore(t *testing.T) {
 	}
 
 	// put the chunks in the store and check their error status
-	err = store.Put(context.Background(), goodChunk)
+	_, err = store.Put(context.Background(), chunk.ModePutUpload, goodChunk)
 	if err == nil {
 		t.Fatal("expected error on good content address chunk with feed update validator only, but got nil")
 	}
-	err = store.Put(context.Background(), badChunk)
+	_, err = store.Put(context.Background(), chunk.ModePutUpload, badChunk)
 	if err == nil {
 		t.Fatal("expected error on bad content address chunk with feed update validator only, but got nil")
 	}
-	err = store.Put(context.Background(), uglyChunk)
+	_, err = store.Put(context.Background(), chunk.ModePutUpload, uglyChunk)
 	if err != nil {
 		t.Fatalf("expected no error on feed update chunk with feed update validator only, but got: %s", err)
 	}
